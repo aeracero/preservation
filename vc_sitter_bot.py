@@ -5,6 +5,15 @@ VC居座りbot（通話記録・レベル・入室メッセージつき）
 - 「#(VC名)に入れ！」           → そのVCに参加して居座る
 - 「入れ」                       → 入れるVCをメニューで選ぶ
 - 「終われ」                     → VCから退出する
+- 切断されたり、botが再起動したりしたら居座りを止め、VCにいた人に@して入れ直しを案内
+  （案内には「もう一度入れる」ボタン付き。VCを移動させられた場合は移動先に居座る）
+
+■ お知らせチャンネル（切断の案内・レベルアップ通知の送り先）
+- 「お知らせチャンネル」          → 今の設定の確認と、メニューで選択
+- 「お知らせチャンネル #チャンネル」→ 指定したチャンネルに設定
+- 「お知らせチャンネルここ」      → 今いるチャンネルに設定
+- 「お知らせチャンネル解除」      → 解除（VCのチャットなどに送る）
+  ※ 変更には「サーバー管理」権限が必要
 
 ■ 記録
 - 「ステータスオープン @ユーザー」  → 通話記録・レベル・ポイントを表示（全員に見える）
@@ -136,6 +145,12 @@ CREATE TABLE IF NOT EXISTS profiles(
     entry_msg INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(guild_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS guild_settings(
+    guild_id INTEGER PRIMARY KEY,
+    announce_channel_id INTEGER,   -- お知らせチャンネル
+    sitting_channel_id INTEGER,    -- 居座り中のVC（再起動の検知用）
+    notify_channel_id INTEGER      -- 居座りを指示したチャンネル
+);
 CREATE TABLE IF NOT EXISTS unlocks(
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -158,6 +173,22 @@ def meta_set(key: str, value: str):
 
 if meta_get("tracking_since") is None:
     meta_set("tracking_since", str(time.time()))
+    db.commit()
+
+
+SETTING_COLUMNS = ("announce_channel_id", "sitting_channel_id", "notify_channel_id")
+
+
+def get_setting(guild_id: int, column: str):
+    assert column in SETTING_COLUMNS
+    row = db.execute(f"SELECT {column} FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    return row[0] if row else None
+
+
+def set_setting(guild_id: int, column: str, value):
+    assert column in SETTING_COLUMNS
+    db.execute("INSERT OR IGNORE INTO guild_settings(guild_id) VALUES(?)", (guild_id,))
+    db.execute(f"UPDATE guild_settings SET {column}=? WHERE guild_id=?", (value, guild_id))
     db.commit()
 
 
@@ -225,6 +256,7 @@ JOIN_RE = re.compile(r"^\s*(?:<#(\d+)>|(#)?\s*(.+?))\s*に入れ\s*!*\s*$")
 LEAVE_RE = re.compile(r"^\s*終われ\s*[!。]*\s*$")
 JOIN_ONLY_RE = re.compile(r"^\s*(?:どこかに)?入れ\s*[!。]*\s*$")
 STATUS_RE = re.compile(r"ステータス\s*オープン")
+ANNOUNCE_RE = re.compile(r"^\s*(?:お知らせ|アナウンス)\s*チャンネル\s*(設定|変更|解除|ここ|確認)?\s*(?:<#(\d+)>)?\s*$")
 RANKING_RE = re.compile(r"^\s*(?:ランキング|順位)\s*[!?]*\s*$")
 ENTRY_RE = re.compile(r"^\s*入室メッセージ\s*(一覧|購入|買う|解放|設定|変更|オフ|off|ランダム)?\s*(\d+)?\s*[!]*\s*$", re.I)
 SELF_WORDS = ("自分", "私", "わたし", "俺", "おれ", "僕", "ぼく")
@@ -298,7 +330,31 @@ def render_entry(text: str, name: str, vc: str, level: int) -> str:
 
 
 # ================= VC検索・接続 =================
-targets: dict[int, int] = {}
+targets: dict[int, int] = {}  # guild_id -> 居座っているVCの channel_id
+
+
+def set_target(guild_id: int, channel_id: int | None):
+    if channel_id is None:
+        targets.pop(guild_id, None)
+    else:
+        targets[guild_id] = channel_id
+    set_setting(guild_id, "sitting_channel_id", channel_id)
+
+
+def can_send(guild: discord.Guild, channel) -> bool:
+    if channel is None or not hasattr(channel, "send"):
+        return False
+    perms = channel.permissions_for(guild.me)
+    return perms.view_channel and perms.send_messages
+
+
+def announce_target(guild: discord.Guild, *fallbacks):
+    """お知らせチャンネル → 指定された候補の順に、送れる最初のチャンネルを返す"""
+    candidates = [guild.get_channel(get_setting(guild.id, "announce_channel_id") or 0), *fallbacks]
+    for ch in candidates:
+        if can_send(guild, ch):
+            return ch
+    return None
 
 
 def voice_channels(guild: discord.Guild):
@@ -621,7 +677,10 @@ async def background_loop():
         await asyncio.sleep(60)
         try:
             meta_set("heartbeat", str(time.time()))
-            for ch, member, new_level, bonus in award_tick():
+            for vc_ch, member, new_level, bonus in award_tick():
+                ch = announce_target(member.guild, vc_ch)
+                if ch is None:
+                    continue
                 try:
                     await ch.send(
                         f"🎉 {discord.utils.escape_markdown(member.display_name)} が **Lv.{new_level}** になりました！（+{bonus} pt）",
@@ -649,12 +708,21 @@ def reconcile_on_startup():
 @client.event
 async def on_ready():
     global started
-    print(f"ログインしました: {client.user} (ID: {client.user.id}) / DB: {DB_PATH}")
+    print(f"ログインしました: {client.user} (ID: {client.user.id}) / DB: {DB_PATH} / PID: {os.getpid()} / "
+          f"サービス: {os.environ.get('RAILWAY_SERVICE_NAME', 'ローカル')} / レプリカ: {os.environ.get('RAILWAY_REPLICA_ID', '-')}")
     if started:
         return
     started = True
     reconcile_on_startup()
     client.loop.create_task(background_loop())
+    # 前回居座っていたのに再起動したサーバーに案内を出す
+    for guild in client.guilds:
+        cid = get_setting(guild.id, "sitting_channel_id")
+        if cid:
+            set_target(guild.id, None)
+            channel = guild.get_channel(cid)
+            if channel:
+                await send_disconnect_notice(guild, channel, "botが再起動したため、VCから抜けました。")
 
 
 # ================= メッセージ =================
@@ -699,8 +767,13 @@ async def on_message(message: discord.Message):
         await handle_entry_command(message, m.group(1), m.group(2))
         return
 
+    m = ANNOUNCE_RE.match(content)
+    if m:
+        await handle_announce_command(message, m.group(1), m.group(2))
+        return
+
     if LEAVE_RE.match(content):
-        targets.pop(guild.id, None)
+        set_target(guild.id, None)
         vc = guild.voice_client
         if vc:
             await vc.disconnect(force=True)
@@ -733,7 +806,7 @@ async def handle_join(message: discord.Message, mention_id, has_hash, name):
         await message.reply(f"候補が複数あります。どれか1つを指定してください: {names}")
         return
 
-    await message.reply(await join_channel(guild, candidates[0]))
+    await message.reply(await join_channel(guild, candidates[0], message.channel))
 
 
 def can_join(guild: discord.Guild, channel) -> bool:
@@ -741,15 +814,17 @@ def can_join(guild: discord.Guild, channel) -> bool:
     return perms.view_channel and perms.connect
 
 
-async def join_channel(guild: discord.Guild, channel) -> str:
+async def join_channel(guild: discord.Guild, channel, notify=None) -> str:
     """VCに入って、結果の文章を返す"""
     if not can_join(guild, channel):
         return f"{channel.mention} に入る権限がありません。"
-    targets[guild.id] = channel.id
+    if notify is not None:
+        set_setting(guild.id, "notify_channel_id", notify.id)
+    set_target(guild.id, channel.id)
     try:
         await ensure_connected(guild, channel)
     except Exception as e:
-        targets.pop(guild.id, None)
+        set_target(guild.id, None)
         return f"接続に失敗しました: `{e}`"
     return f"🔊 {channel.mention} に入りました！「終われ」と言うまで居座ります。"
 
@@ -797,7 +872,7 @@ class JoinView(discord.ui.View):
             return
         self.stop()
         await interaction.response.edit_message(content=f"⏳ {channel.mention} に接続中…", view=None)
-        result = await join_channel(self.guild, channel)
+        result = await join_channel(self.guild, channel, interaction.channel)
         await interaction.edit_original_response(content=f"{result}（選んだ人: {interaction.user.display_name}）")
 
     async def on_cancel(self, interaction: discord.Interaction):
@@ -945,33 +1020,183 @@ def log_voice_update(member: discord.Member, before: discord.VoiceState, after: 
     db.commit()
 
 
-async def rejoin_if_needed(guild: discord.Guild, after: discord.VoiceState):
-    target_id = targets.get(guild.id)
-    if target_id is None:
-        return
-    if after.channel is not None and after.channel.id == target_id:
-        return
+class RejoinView(discord.ui.View):
+    """切断の案内に付ける「もう一度入れる」ボタン"""
 
-    await asyncio.sleep(2)
+    def __init__(self, guild: discord.Guild, channel):
+        super().__init__(timeout=3600)
+        self.guild = guild
+        self.channel = channel
+        self.message: discord.Message | None = None
+        button = discord.ui.Button(label=f"🔊 {channel.name[:60]} にもう一度入れる", style=discord.ButtonStyle.primary)
+        button.callback = self.on_rejoin
+        self.add_item(button)
 
-    target_id = targets.get(guild.id)
-    if target_id is None:
+    async def on_rejoin(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(view=None)
+        result = await join_channel(self.guild, self.channel, interaction.channel)
+        await interaction.followup.send(f"{result}（入れた人: {interaction.user.display_name}）")
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def send_disconnect_notice(guild: discord.Guild, channel, reason: str):
+    """VCにいる人に@して、入れ直しを案内する"""
+    humans = [m for m in channel.members if not m.bot]
+    notify = guild.get_channel(get_setting(guild.id, "notify_channel_id") or 0)
+    ch = announce_target(guild, notify, channel)
+    if ch is None:
+        print(f"[{guild.name}] 案内を送れるチャンネルがありません: {reason}")
         return
-    channel = guild.get_channel(target_id)
-    if channel is None:
-        targets.pop(guild.id, None)
-        return
+    mentions = " ".join(m.mention for m in humans)
+    text = (
+        f"{mentions}\n" if mentions else ""
+    ) + (
+        f"⚠️ {reason}\n"
+        f"居座りを止めています。{channel.mention} にもう一度入れるには、下のボタンを押すか、"
+        f"`#{channel.name}に入れ！` または `入れ` と送ってください。"
+    )
+    view = RejoinView(guild, channel)
     try:
-        await ensure_connected(guild, channel)
-        print(f"[{guild.name}] {channel.name} に戻りました")
-    except Exception as e:
-        print(f"[{guild.name}] 再接続に失敗: {e}")
+        view.message = await ch.send(text, view=view, allowed_mentions=discord.AllowedMentions(users=True))
+    except discord.HTTPException as e:
+        print(f"[{guild.name}] 案内の送信に失敗: {e}")
+
+
+checking: set[int] = set()
+
+
+async def check_bot_voice(guild: discord.Guild):
+    """botのVC状態が変わったとき、本当に切断されたのかを確かめる"""
+    target_id = targets.get(guild.id)
+    if target_id is None or guild.id in checking:
+        return
+    checking.add(guild.id)
+    try:
+        # 一時的な切断なら discord.py が自動で繋ぎ直すので、少し待つ
+        for _ in range(6):
+            await asyncio.sleep(1.5)
+            if targets.get(guild.id) != target_id:
+                return  # 待っている間に「終われ」や別のVC指定があった
+            vc = guild.voice_client
+            if vc and vc.is_connected() and vc.channel and vc.channel.id == target_id:
+                return  # 元のVCに戻れている
+
+        vc = guild.voice_client
+        if vc and vc.is_connected() and vc.channel and vc.channel.id != target_id:
+            # 別のVCに移動させられた → そこに居座る
+            old = guild.get_channel(target_id)
+            set_target(guild.id, vc.channel.id)
+            ch = announce_target(guild, vc.channel)
+            if ch:
+                try:
+                    await ch.send(f"🔀 botが {old.mention if old else 'VC'} から {vc.channel.mention} に移動させられたので、ここに居座ります。")
+                except discord.HTTPException:
+                    pass
+            return
+
+        # 切断された → 止まって案内する
+        set_target(guild.id, None)
+        if vc:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        channel = guild.get_channel(target_id)
+        print(f"[{guild.name}] VCから切断されたので居座りを止めました")
+        if channel:
+            await send_disconnect_notice(guild, channel, "botがVCから切断されました。")
+    finally:
+        checking.discard(guild.id)
+
+
+async def handle_announce_command(message: discord.Message, action: str | None, channel_id: str | None):
+    guild = message.guild
+    current = guild.get_channel(get_setting(guild.id, "announce_channel_id") or 0)
+    current_text = current.mention if current else "未設定（VCのチャットや、居座りを指示したチャンネルに送ります）"
+
+    if (action in (None, "確認", "設定", "変更")) and channel_id is None:
+        view = AnnounceView(guild)
+        view.message = await message.reply(
+            f"📢 今のお知らせチャンネル: {current_text}\n変更する場合は下のメニューから選んでください（サーバー管理権限が必要です）。",
+            view=view, mention_author=False,
+        )
+        return
+
+    if not message.author.guild_permissions.manage_guild:
+        await message.reply("お知らせチャンネルの変更には「サーバー管理」権限が必要です。")
+        return
+
+    if action == "解除":
+        set_setting(guild.id, "announce_channel_id", None)
+        await message.reply("📢 お知らせチャンネルを解除しました。")
+        return
+
+    channel = message.channel if action == "ここ" else guild.get_channel(int(channel_id))
+    await message.reply(apply_announce_channel(guild, channel))
+
+
+def apply_announce_channel(guild: discord.Guild, channel) -> str:
+    if channel is None:
+        return "そのチャンネルが見つかりませんでした。"
+    if not can_send(guild, channel):
+        return f"{channel.mention} にはbotがメッセージを送れません。権限を確認してください。"
+    set_setting(guild.id, "announce_channel_id", channel.id)
+    return f"📢 お知らせチャンネルを {channel.mention} にしました。"
+
+
+class AnnounceView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.message: discord.Message | None = None
+        select = discord.ui.ChannelSelect(
+            placeholder="📢 お知らせを送るチャンネルを選ぶ",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+        )
+        select.callback = self.on_select
+        self.select = select
+        self.add_item(select)
+        clear = discord.ui.Button(label="解除する", style=discord.ButtonStyle.secondary)
+        clear.callback = self.on_clear
+        self.add_item(clear)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.guild_permissions.manage_guild:
+            return True
+        await interaction.response.send_message("変更には「サーバー管理」権限が必要です。", ephemeral=True)
+        return False
+
+    async def on_select(self, interaction: discord.Interaction):
+        channel = self.guild.get_channel(self.select.values[0].id)
+        self.stop()
+        await interaction.response.edit_message(content=apply_announce_channel(self.guild, channel), view=None)
+
+    async def on_clear(self, interaction: discord.Interaction):
+        set_setting(self.guild.id, "announce_channel_id", None)
+        self.stop()
+        await interaction.response.edit_message(content="📢 お知らせチャンネルを解除しました。", view=None)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
 
 
 @client.event
 async def on_voice_state_update(member: discord.Member, before, after):
     if client.user and member.id == client.user.id:
-        await rejoin_if_needed(member.guild, after)
+        target_id = targets.get(member.guild.id)
+        if target_id is not None and (after.channel is None or after.channel.id != target_id):
+            client.loop.create_task(check_bot_voice(member.guild))
         return
     if member.bot:
         return
