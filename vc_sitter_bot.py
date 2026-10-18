@@ -1,12 +1,17 @@
 """
-VC居座りbot（通話記録・レベル・入室メッセージつき）
+VC身代わりbot（通話記録・レベル・入室メッセージつき）
 
-■ 居座り
-- 「#(VC名)に入れ！」           → そのVCに参加して居座る
-- 「入れ」                       → 入れるVCをメニューで選ぶ
+■ 身代わり（みんながVCから抜けても、通話が途切れないようにbotが残る）
+- 「#(VC名)に入れ！」           → そのVCに入る（タイマーは標準の1時間）
+- 「#(VC名)に3時間入れ！」       → タイマーを指定して入る（30分〜12時間）
+- 「入れ」                       → VCとタイマーをメニューで選ぶ
 - 「終われ」                     → VCから退出する
-- 切断されたり、botが再起動したりしたら居座りを止め、VCにいた人に@して入れ直しを案内
-  （案内には「もう一度入れる」ボタン付き。VCを移動させられた場合は移動先に居座る）
+- 「タイマー」 / 「残り」          → タイマーの状態を表示（延長・退出ボタン付き）
+- 「延長」 / 「延長 2時間」        → タイマーを延長（標準+1時間、残り最大12時間）
+- タイマーは「VCが無人になってから」動き、誰かが戻ってくるとリセットされる
+- 終了5分前に呼んだ人へ@で予告、終了したら抜けて案内（「もう一度入れる」ボタン付き）
+- 切断されたり、botが再起動したりしたら身代わりを終了し、VCにいた人に@して案内
+  （VCを移動させられた場合は、移動先で身代わりを続ける）
 
 ■ お知らせチャンネル（切断の案内・レベルアップ通知の送り先）
 - 「お知らせチャンネル」          → 今の設定の確認と、メニューで選択
@@ -61,6 +66,14 @@ XP_PRESENT = 1          # VCにいる1分あたり
 XP_TALK = 1             # ミュートせず他の人といる1分あたりの追加分
 LEVEL_UP_BONUS = 50     # レベルアップ時のポイント
 ENTRY_COOLDOWN = 300    # 同じ人の入室メッセージを出す最短間隔（秒）
+
+# ---- 身代わりタイマーの設定 ----
+DEFAULT_TIMER = 60 * 60          # 標準: 無人になってから1時間で抜ける
+MIN_TIMER = 10 * 60              # 最短 10分
+MAX_TIMER = 12 * 60 * 60         # 最長 12時間（延長しても残りはこれ以上にならない）
+EXTEND_STEP = 60 * 60            # 「延長」1回で +1時間
+WARN_BEFORE = 5 * 60             # 終了の何秒前に予告するか
+TIMER_CHOICES = [30 * 60, 60 * 60, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600]
 
 # ---- 入室メッセージ（{name}=名前, {vc}=VC名, {level}=レベル） ----
 # (番号, 必要ポイント, 本文)
@@ -148,8 +161,8 @@ CREATE TABLE IF NOT EXISTS profiles(
 CREATE TABLE IF NOT EXISTS guild_settings(
     guild_id INTEGER PRIMARY KEY,
     announce_channel_id INTEGER,   -- お知らせチャンネル
-    sitting_channel_id INTEGER,    -- 居座り中のVC（再起動の検知用）
-    notify_channel_id INTEGER      -- 居座りを指示したチャンネル
+    sitting_channel_id INTEGER,    -- 身代わり中のVC（再起動の検知用）
+    notify_channel_id INTEGER      -- 身代わりを指示したチャンネル
 );
 CREATE TABLE IF NOT EXISTS unlocks(
     guild_id INTEGER NOT NULL,
@@ -252,9 +265,12 @@ def add_xp(guild_id: int, user_id: int, gain: int, talking: bool):
 
 
 # ================= 文字列まわり =================
-JOIN_RE = re.compile(r"^\s*(?:<#(\d+)>|(#)?\s*(.+?))\s*に入れ\s*!*\s*$")
+DUR = r"(\d+(?:\.\d+)?\s*(?:時間|分|h|m|min))"
+JOIN_RE = re.compile(r"^\s*(?:<#(\d+)>|(#)?\s*(.+?))\s*に\s*" + DUR + r"?\s*入れ\s*!*\s*" + DUR + r"?\s*!*\s*$")
 LEAVE_RE = re.compile(r"^\s*終われ\s*[!。]*\s*$")
-JOIN_ONLY_RE = re.compile(r"^\s*(?:どこかに)?入れ\s*[!。]*\s*$")
+JOIN_ONLY_RE = re.compile(r"^\s*(?:どこかに)?\s*" + DUR + r"?\s*入れ\s*[!。]*\s*" + DUR + r"?\s*[!。]*\s*$")
+TIMER_RE = re.compile(r"^\s*(?:タイマー|残り|のこり)\s*[?!]*\s*$")
+EXTEND_RE = re.compile(r"^\s*延長\s*" + DUR + r"?\s*[!。]*\s*$")
 STATUS_RE = re.compile(r"ステータス\s*オープン")
 ANNOUNCE_RE = re.compile(r"^\s*(?:お知らせ|アナウンス)\s*チャンネル\s*(設定|変更|解除|ここ|確認)?\s*(?:<#(\d+)>)?\s*$")
 RANKING_RE = re.compile(r"^\s*(?:ランキング|順位)\s*[!?]*\s*$")
@@ -275,7 +291,7 @@ def fmt_dur(sec: float) -> str:
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
     if h:
-        return f"{h}時間{m}分"
+        return f"{h}時間{m}分" if m else f"{h}時間"
     if m:
         return f"{m}分"
     return f"{s}秒"
@@ -330,15 +346,72 @@ def render_entry(text: str, name: str, vc: str, level: int) -> str:
 
 
 # ================= VC検索・接続 =================
-targets: dict[int, int] = {}  # guild_id -> 居座っているVCの channel_id
+targets: dict[int, int] = {}  # guild_id -> 身代わり中のVCの channel_id
+
+
+class SitTimer:
+    def __init__(self, duration: int, summoner_id: int | None):
+        self.duration = duration          # 無人になってから抜けるまでの秒数
+        self.summoner_id = summoner_id    # 呼んだ人（予告・終了の@先）
+        self.deadline: float | None = None  # 無人の間だけ設定される
+        self.warned = False
+
+
+timers: dict[int, SitTimer] = {}
 
 
 def set_target(guild_id: int, channel_id: int | None):
     if channel_id is None:
         targets.pop(guild_id, None)
+        timers.pop(guild_id, None)
     else:
         targets[guild_id] = channel_id
     set_setting(guild_id, "sitting_channel_id", channel_id)
+
+
+def parse_duration(text: str | None) -> int | None:
+    if not text:
+        return None
+    m = re.match(r"(\d+(?:\.\d+)?)\s*(時間|分|h|m|min)", text)
+    if not m:
+        return None
+    value = float(m.group(1))
+    return int(value * 3600) if m.group(2) in ("時間", "h") else int(value * 60)
+
+
+def clamp_timer(sec: int) -> int:
+    return max(MIN_TIMER, min(MAX_TIMER, sec))
+
+
+def humans_in(channel) -> list:
+    return [m for m in channel.members if not m.bot] if channel else []
+
+
+def timer_status_text(guild: discord.Guild) -> str:
+    target_id = targets.get(guild.id)
+    t = timers.get(guild.id)
+    if target_id is None or t is None:
+        return "今は身代わりをしていません。"
+    channel = guild.get_channel(target_id)
+    where = channel.mention if channel else "VC"
+    if t.deadline is None:
+        n = len(humans_in(channel))
+        return f"⏳ {where} で待機中（{n}人が通話中のためタイマー停止中）。無人になってから **{fmt_dur(t.duration)}** で抜けます。"
+    left = max(0, t.deadline - time.time())
+    return f"⏳ {where} は無人です。あと **{fmt_dur(left)}** で抜けます（{fmt_hm(t.deadline)} ごろ）。"
+
+
+def extend_timer(guild_id: int, sec: int) -> str:
+    t = timers.get(guild_id)
+    if t is None:
+        return "今は身代わりをしていません。"
+    t.duration = min(MAX_TIMER, t.duration + sec)
+    if t.deadline is not None:
+        now = time.time()
+        t.deadline = min(now + MAX_TIMER, t.deadline + sec)
+        t.warned = t.deadline - now <= WARN_BEFORE
+        return f"⏱️ 延長しました。あと **{fmt_dur(t.deadline - now)}** で抜けます（{fmt_hm(t.deadline)} ごろ）。"
+    return f"⏱️ 延長しました。無人になってから **{fmt_dur(t.duration)}** で抜けます。"
 
 
 def can_send(guild: discord.Guild, channel) -> bool:
@@ -715,6 +788,7 @@ async def on_ready():
     started = True
     reconcile_on_startup()
     client.loop.create_task(background_loop())
+    client.loop.create_task(timer_loop())
     # 前回居座っていたのに再起動したサーバーに案内を出す
     for guild in client.guilds:
         cid = get_setting(guild.id, "sitting_channel_id")
@@ -722,7 +796,7 @@ async def on_ready():
             set_target(guild.id, None)
             channel = guild.get_channel(cid)
             if channel:
-                await send_disconnect_notice(guild, channel, "botが再起動したため、VCから抜けました。")
+                await send_disconnect_notice(guild, channel, "⚠️ botが再起動したため、VCから抜けました。")
 
 
 # ================= メッセージ =================
@@ -746,8 +820,22 @@ async def on_message(message: discord.Message):
             view.message = await message.reply(embed=view.make_embed(), view=view, mention_author=False)
         return
 
-    if JOIN_ONLY_RE.match(content):
-        await show_join_menu(message)
+    m = JOIN_ONLY_RE.match(content)
+    if m:
+        await show_join_menu(message, parse_duration(m.group(1) or m.group(2)))
+        return
+
+    if TIMER_RE.match(content):
+        view = TimerView(guild) if guild.id in timers else None
+        msg = await message.reply(timer_status_text(guild), view=view, mention_author=False)
+        if view:
+            view.message = msg
+        return
+
+    m = EXTEND_RE.match(content)
+    if m:
+        sec = parse_duration(m.group(1)) or EXTEND_STEP
+        await message.reply(extend_timer(guild.id, sec), mention_author=False)
         return
 
     if "履歴" in content and any(w in content.lower() for w in ("保存", "csv", "ダウンロード")):
@@ -784,10 +872,11 @@ async def on_message(message: discord.Message):
 
     m = JOIN_RE.match(content)
     if m:
-        await handle_join(message, m.group(1), m.group(2), m.group(3))
+        duration = parse_duration(m.group(4) or m.group(5))
+        await handle_join(message, m.group(1), m.group(2), m.group(3), duration)
 
 
-async def handle_join(message: discord.Message, mention_id, has_hash, name):
+async def handle_join(message: discord.Message, mention_id, has_hash, name, duration=None):
     guild = message.guild
     if mention_id:
         ch = guild.get_channel(int(mention_id))
@@ -806,7 +895,7 @@ async def handle_join(message: discord.Message, mention_id, has_hash, name):
         await message.reply(f"候補が複数あります。どれか1つを指定してください: {names}")
         return
 
-    await message.reply(await join_channel(guild, candidates[0], message.channel))
+    await message.reply(await join_channel(guild, candidates[0], message.channel, duration, message.author.id))
 
 
 def can_join(guild: discord.Guild, channel) -> bool:
@@ -814,29 +903,51 @@ def can_join(guild: discord.Guild, channel) -> bool:
     return perms.view_channel and perms.connect
 
 
-async def join_channel(guild: discord.Guild, channel, notify=None) -> str:
+async def join_channel(guild: discord.Guild, channel, notify=None, duration=None, summoner_id=None) -> str:
     """VCに入って、結果の文章を返す"""
     if not can_join(guild, channel):
         return f"{channel.mention} に入る権限がありません。"
+    duration = clamp_timer(duration or DEFAULT_TIMER)
     if notify is not None:
         set_setting(guild.id, "notify_channel_id", notify.id)
     set_target(guild.id, channel.id)
+    timers[guild.id] = SitTimer(duration, summoner_id)
     try:
         await ensure_connected(guild, channel)
     except Exception as e:
         set_target(guild.id, None)
         return f"接続に失敗しました: `{e}`"
-    return f"🔊 {channel.mention} に入りました！「終われ」と言うまで居座ります。"
+    return (
+        f"🔊 {channel.mention} に身代わりで入りました！\n"
+        f"⏳ VCが無人になってから **{fmt_dur(duration)}** で自動で抜けます（誰かが戻るとリセット）。"
+        f"`延長` で延長、`終われ` ですぐ抜けます。"
+    )
 
 
 # ================= メニュー（ボタン・選択肢） =================
 class JoinView(discord.ui.View):
     """「入れ」だけ言われたときのVC選択メニュー"""
 
-    def __init__(self, guild: discord.Guild, author: discord.Member):
+    def __init__(self, guild: discord.Guild, author: discord.Member, duration: int | None = None):
         super().__init__(timeout=300)
         self.guild = guild
         self.message: discord.Message | None = None
+        self.duration = clamp_timer(duration or DEFAULT_TIMER)
+
+        choices = sorted(set(TIMER_CHOICES) | {self.duration})
+        self.timer_select = discord.ui.Select(
+            placeholder="⏳ 無人になってから抜けるまでの時間",
+            options=[
+                discord.SelectOption(
+                    label=f"{fmt_dur(sec)}で抜ける", value=str(sec), emoji="⏳",
+                    description="標準" if sec == DEFAULT_TIMER else None, default=(sec == self.duration),
+                )
+                for sec in choices
+            ],
+            row=0,
+        )
+        self.timer_select.callback = self.on_timer
+        self.add_item(self.timer_select)
 
         author_vc = author.voice.channel if author.voice else None
         bot_vc = guild.voice_client.channel if guild.voice_client else None
@@ -858,12 +969,18 @@ class JoinView(discord.ui.View):
             options.append(discord.SelectOption(label=c.name[:100], value=str(c.id), description=desc, emoji="🔊"))
 
         if options:
-            select = discord.ui.Select(placeholder="🔊 入るVCを選んでください", options=options)
+            select = discord.ui.Select(placeholder="🔊 入るVCを選んでください", options=options, row=1)
             select.callback = self.on_select
             self.add_item(select)
-        cancel = discord.ui.Button(label="やめる", style=discord.ButtonStyle.secondary)
+        cancel = discord.ui.Button(label="やめる", style=discord.ButtonStyle.secondary, row=2)
         cancel.callback = self.on_cancel
         self.add_item(cancel)
+
+    async def on_timer(self, interaction: discord.Interaction):
+        self.duration = int(self.timer_select.values[0])
+        for opt in self.timer_select.options:
+            opt.default = int(opt.value) == self.duration
+        await interaction.response.edit_message(view=self)
 
     async def on_select(self, interaction: discord.Interaction):
         channel = self.guild.get_channel(int(interaction.data["values"][0]))
@@ -872,8 +989,8 @@ class JoinView(discord.ui.View):
             return
         self.stop()
         await interaction.response.edit_message(content=f"⏳ {channel.mention} に接続中…", view=None)
-        result = await join_channel(self.guild, channel, interaction.channel)
-        await interaction.edit_original_response(content=f"{result}（選んだ人: {interaction.user.display_name}）")
+        result = await join_channel(self.guild, channel, interaction.channel, self.duration, interaction.user.id)
+        await interaction.edit_original_response(content=f"{result}（呼んだ人: {interaction.user.display_name}）")
 
     async def on_cancel(self, interaction: discord.Interaction):
         self.stop()
@@ -887,12 +1004,12 @@ class JoinView(discord.ui.View):
                 pass
 
 
-async def show_join_menu(message: discord.Message):
-    view = JoinView(message.guild, message.author)
+async def show_join_menu(message: discord.Message, duration: int | None = None):
+    view = JoinView(message.guild, message.author, duration)
     if view.count == 0:
         await message.reply("botが入れるVCがありません（権限を確認してください）。")
         return
-    text = "🔊 どのVCに入りますか？"
+    text = "🔊 どのVCに身代わりで入りますか？（先に上のメニューでタイマーを変えられます）"
     if view.truncated:
         text += f"\n（VCが {view.count} 個あるので、上位25個を表示しています。ほかのVCは `#VC名に入れ！` で指定してください）"
     view.message = await message.reply(text, view=view, mention_author=False)
@@ -1020,23 +1137,32 @@ def log_voice_update(member: discord.Member, before: discord.VoiceState, after: 
     db.commit()
 
 
-class RejoinView(discord.ui.View):
-    """切断の案内に付ける「もう一度入れる」ボタン"""
+class TimerView(discord.ui.View):
+    """タイマーの予告・状態表示に付ける「延長」「今すぐ抜ける」ボタン"""
 
-    def __init__(self, guild: discord.Guild, channel):
-        super().__init__(timeout=3600)
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=1800)
         self.guild = guild
-        self.channel = channel
         self.message: discord.Message | None = None
-        button = discord.ui.Button(label=f"🔊 {channel.name[:60]} にもう一度入れる", style=discord.ButtonStyle.primary)
-        button.callback = self.on_rejoin
-        self.add_item(button)
+        extend = discord.ui.Button(label=f"⏱️ +{fmt_dur(EXTEND_STEP)} 延長", style=discord.ButtonStyle.primary)
+        extend.callback = self.on_extend
+        leave = discord.ui.Button(label="👋 今すぐ抜ける", style=discord.ButtonStyle.secondary)
+        leave.callback = self.on_leave
+        self.add_item(extend)
+        self.add_item(leave)
 
-    async def on_rejoin(self, interaction: discord.Interaction):
+    async def on_extend(self, interaction: discord.Interaction):
+        text = extend_timer(self.guild.id, EXTEND_STEP)
+        await interaction.response.send_message(f"{text}（延長した人: {interaction.user.display_name}）")
+
+    async def on_leave(self, interaction: discord.Interaction):
         self.stop()
+        set_target(self.guild.id, None)
+        vc = self.guild.voice_client
+        if vc:
+            await vc.disconnect(force=True)
         await interaction.response.edit_message(view=None)
-        result = await join_channel(self.guild, self.channel, interaction.channel)
-        await interaction.followup.send(f"{result}（入れた人: {interaction.user.display_name}）")
+        await interaction.followup.send(f"👋 抜けました。（操作した人: {interaction.user.display_name}）")
 
     async def on_timeout(self):
         if self.message:
@@ -1046,23 +1172,111 @@ class RejoinView(discord.ui.View):
                 pass
 
 
-async def send_disconnect_notice(guild: discord.Guild, channel, reason: str):
-    """VCにいる人に@して、入れ直しを案内する"""
-    humans = [m for m in channel.members if not m.bot]
+async def timer_tick():
+    """10秒ごと: 無人のVCでタイマーを進め、予告・自動退出をする"""
+    now = time.time()
+    for guild_id, target_id in list(targets.items()):
+        guild = client.get_guild(guild_id)
+        t = timers.get(guild_id)
+        if guild is None or t is None:
+            continue
+        channel = guild.get_channel(target_id)
+        if channel is None:
+            continue
+
+        if humans_in(channel):
+            # 誰かいる間は身代わり不要なのでタイマー停止（戻ってきたらリセット）
+            t.deadline = None
+            t.warned = False
+            continue
+        if t.deadline is None:
+            t.deadline = now + t.duration
+            continue
+
+        left = t.deadline - now
+        notify = guild.get_channel(get_setting(guild_id, "notify_channel_id") or 0)
+
+        if left <= 0:
+            summoner, duration = t.summoner_id, t.duration
+            set_target(guild_id, None)
+            vc = guild.voice_client
+            if vc:
+                await vc.disconnect(force=True)
+            print(f"[{guild.name}] タイマー終了で {channel.name} から抜けました")
+            await send_disconnect_notice(
+                guild, channel, f"⏰ 無人のまま {fmt_dur(duration)} たったので、{channel.mention} から抜けました。",
+                (summoner,), duration,
+            )
+        elif not t.warned and left <= WARN_BEFORE and t.duration > WARN_BEFORE:
+            t.warned = True
+            ch = announce_target(guild, notify, channel)
+            if ch:
+                mention = f"<@{t.summoner_id}> " if t.summoner_id else ""
+                view = TimerView(guild)
+                try:
+                    view.message = await ch.send(
+                        f"{mention}⏳ あと約{fmt_dur(left)}で {channel.mention} の身代わりを終了します。続ける場合は延長してください。",
+                        view=view, allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                except discord.HTTPException:
+                    pass
+
+
+async def timer_loop():
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await timer_tick()
+        except Exception as e:
+            print(f"タイマー処理でエラー: {e}")
+
+
+class RejoinView(discord.ui.View):
+    """切断の案内に付ける「もう一度入れる」ボタン"""
+
+    def __init__(self, guild: discord.Guild, channel, duration: int = DEFAULT_TIMER):
+        super().__init__(timeout=3600)
+        self.guild = guild
+        self.channel = channel
+        self.duration = duration
+        self.message: discord.Message | None = None
+        button = discord.ui.Button(label=f"🔊 {channel.name[:60]} にもう一度入れる", style=discord.ButtonStyle.primary)
+        button.callback = self.on_rejoin
+        self.add_item(button)
+
+    async def on_rejoin(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(view=None)
+        result = await join_channel(self.guild, self.channel, interaction.channel, self.duration, interaction.user.id)
+        await interaction.followup.send(f"{result}（呼んだ人: {interaction.user.display_name}）")
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def send_disconnect_notice(guild: discord.Guild, channel, reason: str,
+                                 extra_ids: tuple = (), duration: int = DEFAULT_TIMER):
+    """VCにいる人（＋呼んだ人）に@して、入れ直しを案内する"""
+    ids = [m.id for m in humans_in(channel)]
+    ids += [i for i in extra_ids if i and i not in ids]
     notify = guild.get_channel(get_setting(guild.id, "notify_channel_id") or 0)
     ch = announce_target(guild, notify, channel)
     if ch is None:
         print(f"[{guild.name}] 案内を送れるチャンネルがありません: {reason}")
         return
-    mentions = " ".join(m.mention for m in humans)
+    mentions = " ".join(f"<@{i}>" for i in ids)
     text = (
         f"{mentions}\n" if mentions else ""
     ) + (
-        f"⚠️ {reason}\n"
-        f"居座りを止めています。{channel.mention} にもう一度入れるには、下のボタンを押すか、"
+        f"{reason}\n"
+        f"身代わりを終了しました。{channel.mention} にもう一度入れるには、下のボタンを押すか、"
         f"`#{channel.name}に入れ！` または `入れ` と送ってください。"
     )
-    view = RejoinView(guild, channel)
+    view = RejoinView(guild, channel, duration)
     try:
         view.message = await ch.send(text, view=view, allowed_mentions=discord.AllowedMentions(users=True))
     except discord.HTTPException as e:
@@ -1096,12 +1310,15 @@ async def check_bot_voice(guild: discord.Guild):
             ch = announce_target(guild, vc.channel)
             if ch:
                 try:
-                    await ch.send(f"🔀 botが {old.mention if old else 'VC'} から {vc.channel.mention} に移動させられたので、ここに居座ります。")
+                    await ch.send(f"🔀 botが {old.mention if old else 'VC'} から {vc.channel.mention} に移動させられたので、ここで身代わりを続けます。")
                 except discord.HTTPException:
                     pass
             return
 
         # 切断された → 止まって案内する
+        t = timers.get(guild.id)
+        summoner = t.summoner_id if t else None
+        duration = t.duration if t else DEFAULT_TIMER
         set_target(guild.id, None)
         if vc:
             try:
@@ -1109,9 +1326,9 @@ async def check_bot_voice(guild: discord.Guild):
             except Exception:
                 pass
         channel = guild.get_channel(target_id)
-        print(f"[{guild.name}] VCから切断されたので居座りを止めました")
+        print(f"[{guild.name}] VCから切断されたので身代わりを終了しました")
         if channel:
-            await send_disconnect_notice(guild, channel, "botがVCから切断されました。")
+            await send_disconnect_notice(guild, channel, "⚠️ botがVCから切断されました。", (summoner,), duration)
     finally:
         checking.discard(guild.id)
 
@@ -1119,7 +1336,7 @@ async def check_bot_voice(guild: discord.Guild):
 async def handle_announce_command(message: discord.Message, action: str | None, channel_id: str | None):
     guild = message.guild
     current = guild.get_channel(get_setting(guild.id, "announce_channel_id") or 0)
-    current_text = current.mention if current else "未設定（VCのチャットや、居座りを指示したチャンネルに送ります）"
+    current_text = current.mention if current else "未設定（VCのチャットや、身代わりを指示したチャンネルに送ります）"
 
     if (action in (None, "確認", "設定", "変更")) and channel_id is None:
         view = AnnounceView(guild)
